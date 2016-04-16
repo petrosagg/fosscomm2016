@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		<title>Running ARM containers on x86 platforms</title>
+		<meta charset="utf-8">
+		<link href='https://fonts.googleapis.com/css?family=Ubuntu' rel='stylesheet' type='text/css' />
+		<link rel="stylesheet" type="text/css" href="style.css">
+	</head>
+	<body>
+		<textarea id="source">
+
+class: center, middle
+
+# Running ARM containers on x86 platforms
+
+Petros Angelatos
+
+FOSSCOMM, April 2016
+
+---
+
+# About me
+
+* Petros Angelatos
+
+
+* CTO &amp; Founder of <img src="https://resin.io/logo/logo.svg" width="20px" style="vertical-align: middle" /> `resin.io`
+	* Devops for IoT
+	* Hundreds of builds per day
+
+---
+
+### ARM
+
+# Most SoC have an ARM core
+
+* ARM CPUs
+	* Different instruction set
+	* Different ABI
+	* Different syscall numbers
+
+???
+
+RaspberryPi
+
+---
+
+class: center, middle
+
+# Why we run ARM on x86
+
+Our goal is to **build Dockerfiles** based on ARM docker images
+
+---
+
+### Why we run ARM on x86
+
+# Alternative: Natively on the target CPU
+
+* Pros
+	* Identical build and runtime environment
+
+
+* Cons
+	* Bad performance
+	* Maintenance of keeping it online
+	* Hardware failures
+
+???
+
+The idea with this method is that a target device will be online and will accept build jobs from a controlling server.
+
+Didn't meet our requirements
+
+---
+
+### Why we run ARM on x86
+
+# Alternative: Natively on ARM servers
+
+* Pros
+	* Good performance
+
+
+* Cons
+	* Very few providers
+	* Difficult to integrate with other clouds
+		* Cross-DC traffic encryption
+		* Constraints on where DC can be
+		* Data transfer costs
+
+???
+
+Tried but had issues
+
+* Scaleway
+	* Was too unstable for production workloads
+* Hetzner
+	* Added support briefly. Discontinued
+
+---
+
+### Why we run ARM on x86
+
+# Alternative: Emulated hardware on x86
+
+* Pros
+	* Independent of infrastructure provider
+	* Runs everywhere
+	* Pushes multi-DC headaches to the future :)
+
+
+* Cons
+	* Some performance penalty
+	* Emulation layer can have bugs
+
+???
+
+* We've been running it in production for 2 years now
+* Had to fix bugs bugs in the emulation layer
+
+---
+
+# Emulation layer
+
+* QEMU project (**Q**uick **EMU**lator)
+	* Dynamic binary translation
+	* Supports many target architectures
+
+???
+
+We could use the same technique to run MIPS containers in the future
+
+---
+
+### QEMU
+
+# Introduction
+
+* **system** emulation
+	* Like a VM
+	* Emulates a **full guest kernel**
+
+
+* **user-mode** emulation
+	* Emulates only the target binary
+	* System calls are serviced by **host kernel**
+		* Translated by the QEMU runtime
+
+---
+
+### QEMU
+
+# Architecture: system emulation
+
+<pre>
++---------------+
+| Host process  |
+|+-------------+|
+||   ARM CPU   ||
+|| +---------+ ||            +-------+
+|| |   ARM   | ||            | x86   |
+|| |  kernel | || <--------> | linux |
+|| +---------+ ||            +-------+
+|+-------------+|
++---------------+
+
+</pre>
+
+???
+
+The host kernel doesn't see the guest ARM processes, or the filesystem
+
+QEMU must emulate a guest scheduler, a guest filesystem. Slow.
+
+---
+
+### QEMU
+
+# Architecture: user mode emulation
+
+<pre>
++---------------+
+| Host process  |
+|+-------------+|
+||   ARM CPU   ||
+|| +---------+ ||            +-------+
+|| |   ARM   | ||   QEMU     | x86   |
+|| | process <---------------> linux |
+|| +---------+ || syscall.c  +-------+
+|+-------------+|
++---------------+
+</pre>
+
+---
+
+class: center, middle
+
+# DEMO
+
+Simple QEMU emulation
+
+???
+
+hello_native
+
+Compile a simple Go binary for ARM and emulate it
+
+```
+go build hello.go
+./hello
+
+GOARCH=arm go build hello.go
+./hello
+file hello
+qemu-arm hello
+```
+---
+
+class: center, middle
+
+# DEMO
+
+Complex QEMU emulation
+
+???
+
+hello_complex
+
+compile a more complex binary for ARM that `execve`s and fails
+
+```
+go build hello_parent.go
+go build hello_child.go
+./hello_parent
+
+GOARCH=arm go build hello_parent.go
+GOARCH=arm go build hello_child.go
+qemu-arm ./hello_parent # HANGS
+
+strace -f -e trace=process qemu-arm ./hello_parent
+```
+
+---
+
+# Processes that spawn processes fail
+
+* `execve(2)` **replaces the image** of a process
+* The image of the first process contains QEMU
+* The child process doesn't
+* x86 kernel **can't run the ARM ELF** format
+
+---
+
+# Processes that spawn processes fail
+
+<pre>
++---------------+            +-------+
+| Host process  |   execve() | x86   |
+|+-------------+| +----------> linux |
+||   ARM CPU   || |          +---|---+
+|| +---------+ || |              |      
+|| |   ARM   | || |              X ERROR!
+|| | process <----+          +---------+
+|| +---------+ ||            |  ARM    |          
+|+-------------+|            | process |          
++---------------+            +---------+          
+</pre>
+
+---
+
+# Inside an `execve(2)`
+
+* Iterate over known binary format handlers
+* Use matching handler to run the file
+
+
+* Binary formats registered through `register_binfmt(struct linux_binfmt *fmt)`
+
+
+* Built-in binary formats
+	* ELF (`fs/binfmt_elf.c`)
+	* Shebang (`fs/binfmt_script.c`)
+
+---
+
+# binfmt_misc
+
+* Kernel module or built-in (`fs/binfmt_misc.c`)
+* **Userspace API** to the binary format subsystem
+
+
+* Exposed through `binfmt_misc` filesystem
+	* Usually mounted on `/proc/sys/fs/binfmt_misc`
+
+
+* Can register **new binary formats** at runtime
+* Used to give native feel to
+	* Java applications (through jvm)
+	* Windows applications (through wine)
+
+---
+
+# binfmt_misc: ARM emulation
+
+* Specify a magic header to match against
+	* ELF header contains the CPU architecture
+	* Use the **ARM ELF signature**
+
+
+* Specify a path to an interpreter
+	* Use `/usr/bin/qemu-arm`
+
+```sh
+echo ':arm:M::
+\x7fELF
+\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00
+\x28
+\x00:\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff
+:/usr/bin/qemu-arm:' > /proc/sys/fs/binfmt_misc/register
+```
+
+???
+
+* `:arm:` -> name of our format
+* `M` -> use magic to match binaries
+* `\x7fELF` -> ELF magic value
+* `\x28` -> e_machine value, architecture
+* `:/usr/bin/qemu-arm` -> path to interpreter
+
+---
+
+class: center, middle
+
+# DEMO
+
+Complex QEMU emulation with `binfmt_misc`
+
+---
+
+# binfmt_misc: Integration with Docker
+
+* `binfmt_misc` respects mount namespaces
+
+
+* Create a hybrid image
+	* x86 QEMU binary inside an **ARM rootfs**
+	* Use the path configured in `binfmt_misc`
+
+```Dockerfile
+FROM resin/armhf-alpine:3.3
+
+COPY qemu-arm /usr/bin/qemu-arm
+
+RUN echo "Hello from ARM Docker container :)"
+```
+
+---
+
+class: center, middle
+
+# DEMO
+
+Run an ARM Docker container
+
+???
+
+```
+docker build .
+ldd qemu-arm
+```
+
+---
+
+# binfmt_misc: Integration with Docker
+
+* Problems with dynamic linking
+	* Need to include all the **required libraries**
+	* Need to include the **linker**
+	* Potentially clashing library paths
+
+
+* Solution: Link QEMU statically
+	* `./configure --static`
+
+```Dockerfile
+FROM resin/armhf-alpine:3.3
+
+COPY qemu-arm-static /usr/bin/qemu-arm
+
+RUN echo "Hello from ARM Docker container :)"
+```
+
+---
+
+class: center, middle
+
+# DEMO
+
+Run an ARM Docker container with static QEMU
+
+???
+
+```
+ldd qemu-arm-static
+docker build .
+```
+
+---
+
+class: center, middle
+
+# NOT GOOD ENOUGH
+
+---
+
+# binfmt_misc is good but not great
+
+* Needs **root access** to configure
+* Not present in the majority of hosted tools
+
+* `execve(2)` is to blame
+
+---
+
+# Inside an `execve()`, take 2
+
+1. Emulated CPU runs syscall assembly
+1. QEMU **traps** the syscall
+1. `do_syscall()` from `linux-user/syscall.c` runs
+1. Translates syscall number and arguments
+1. Calls **host kernel**
+
+---
+
+# Injecting QEMU interpreter
+
+* Change `do_syscall()` in QEMU
+* Inject QEMU in the arguments of `execve(2)`
+
+```C
+static abi_long qemu_execve(char *filename, char *argv[], char *envp[]) {
+    for (argc = 0; argv[argc] != NULL; argc++);
+
+    new_argp = alloca((argc + 3 + 1) * sizeof(void *));
+
+    for (i = 0; i < argc; i++)
+        new_argp[i + 3] = argv[i];
+    new_argp[i + 3] = NULL;
+
+    new_argp[0] = strdup("/usr/bin/qemu-arm");
+    new_argp[1] = strdup("-0");
+    new_argp[2] = argv[0];
+    new_argp[3] = filename;
+
+    return get_errno(execve("/usr/bin/qemu-arm", new_argp, envp));
+}
+```
+
+???
+
+We inject 3 arguments and a NULL at the end
+
+We always execve to qemu
+
+---
+
+# Dockerfile syntax
+
+* We have to manually start QEMU
+
+```Dockerfile
+FROM resin/armhf-alpine:3.3
+
+COPY qemu-arm-static /usr/bin/qemu-arm
+
+RUN [ "qemu-arm", "/bin/echo", "Hello from ARM Docker container :)" ]
+```
+
+---
+
+class: center, middle
+
+# DEMO
+
+Run an ARM container without `binfmt_misc`
+
+???
+
+* Disable `binfmt_misc`
+	* `echo -1 > /proc/sys/fs/binfmt_misc/arm`
+
+---
+
+# Improving the Dockerfile syntax
+
+* Running a **`RUN`** command
+
+```Dockerfile
+RUN foo
+```
+Becomes
+```C
+execve("/bin/sh", { "-c", "foo" })
+```
+
+* `/bin/sh` is an **ARM binary**
+
+* We could replace `/bin/sh` with something else
+
+---
+
+# Improving the Dockerfile syntax
+
+1. Restore real `/bin/sh`
+1. Inject QEMU and run `/bin/sh` command
+1. Put modified /bin/sh back
+
+---
+
+# Improving the Dockerfile syntax
+
+* Using `cross-build-start`, `cross-build-end`
+
+---
+
+# DEMO
+Dockerfile syntax with [ "cross-build-start" ]
+
+---
+
+# Results
+
+* We **don't** need a special kernel
+
+* Dockerhub automated builds
+
+* Travis CI integration
+
+* Local development
+
+???
+
+Mention MIPS
+
+---
+
+# resin.io <span style="color: red">♥</span> open source
+
+* QEMU source [github.com/resin-io/qemu](github.com/resin-io/qemu)
+	* Improved signal handling
+	* Fixed `golang` emulation
+	* Fixed `nodejs` emulation
+	* `QEMU_EXECVE` feature
+		* In the process of getting **upstreamed**
+
+---
+
+# resin.io <span style="color: red">♥</span> open source
+
+* [resin-io-library/base-images](https://github.com/resin-io-library/base-images)
+* [Dockerhub account](https://hub.docker.com/u/resin/)
+	* Dockerfiles for ARM5, ARM6, ARM7
+	* Dockerfiles for specific boards
+		* 15 boards supported
+	* Dockerfiles for common languages
+		* python
+		* nodejs
+		* golang
+	* Dockerfiles based on
+		* Alpine Linux
+		* Debian Jessie
+		* Debian Wheezy
+
+---
+
+class: center, middle
+
+# Shameless plug
+
+We're hiring, talk to me
+
+---
+
+class: center, middle
+
+# Thanks! Questions?
+
+Petros Angelatos <petrosagg@resin.io>
+
+<span style="font-size: 27px">`BA81 DC1C D900 9B24 2F88 6FDD 4404 DDEE 92BF 1079`</span>
+
+		</textarea>
+		<script src="remark-latest.min.js">
+		</script>
+		<script>
+			var slideshow = remark.create({
+				ratio: '4:3',
+				highlightStyle: 'monokai',
+				highlightLines: true,
+				navigation: {
+					scroll: false,
+					touch: false,
+					click: false
+				},
+				slideNumberFormat: ''
+			});
+		</script>
+	</body>
+</html>
