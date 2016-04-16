@@ -24,9 +24,10 @@ FOSSCOMM, April 2016
 * Petros Angelatos
 
 
-* CTO &amp; Founder of <img src="https://resin.io/logo/logo.svg" width="20px" style="vertical-align: middle" /> `resin.io`
+* CTO &amp; Founder of <img src="https://resin.io/logo/logo.svg" width="30px" style="vertical-align: middle" /> **resin.io**
 	* Devops for IoT
-	* Hundreds of builds per day
+	* Hundreds of ARM builds per day
+	* Many supported CPU architectures
 
 ---
 
@@ -126,6 +127,10 @@ Tried but had issues
 * QEMU project (**Q**uick **EMU**lator)
 	* Dynamic binary translation
 	* Supports many target architectures
+
+
+* Other options availalbe
+	* e.g UMEQ
 
 ???
 
@@ -246,8 +251,14 @@ strace -f -e trace=process qemu-arm ./hello_parent
 # Processes that spawn processes fail
 
 * `execve(2)` **replaces the image** of a process
+
+
 * The image of the first process contains QEMU
+
+
 * The child process doesn't
+
+
 * x86 kernel **can't run the ARM ELF** format
 
 ---
@@ -520,12 +531,42 @@ execve("/bin/sh", { "-c", "foo" })
 
 # Improving the Dockerfile syntax
 
-* Using `cross-build-start`, `cross-build-end`
+```Go
+// sh-shim.go
+os.Remove("/bin/sh")
+os.Symlink("/bin/sh.real", "/bin/sh")
+
+// Inject QEMU
+cmd := exec.Command("/usr/bin/qemu-arm", os.Args...)
+cmd.Stdout = os.Stdout
+cmd.Stderr = os.Stderr
+cmd.Run()
+
+os.Remove("/bin/sh")
+os.Symlink("/bin/sh.shim", "/bin/sh")
+```
+
+```Dockerfile
+FROM resin/armhf-alpine:3.3
+
+COPY qemu-arm-static /usr/bin/qemu-arm
+
+COPY sh-shim /bin/sh.shim
+
+RUN [ "qemu-arm", "/bin/cp", "/bin/sh", "/bin/sh.real" ]
+
+RUN [ "qemu-arm", "/bin/ln", "-f", "/bin/sh.shim", "/bin/sh" ]
+
+RUN echo "Now I don't have to use square brackets :)"
+```
 
 ---
 
+class: center, middle
+
 # DEMO
-Dockerfile syntax with [ "cross-build-start" ]
+
+ARM Dockerfile with pretty syntax
 
 ---
 
@@ -533,11 +574,16 @@ Dockerfile syntax with [ "cross-build-start" ]
 
 * We **don't** need a special kernel
 
+
 * Dockerhub automated builds
 
+
 * Travis CI integration
+	* PR testing for your ARM project
+
 
 * Local development
+	* ARM containers Just Work™
 
 ???
 
