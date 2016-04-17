@@ -17,6 +17,16 @@ Petros Angelatos
 
 FOSSCOMM, April 2016
 
+???
+
+We'll talk about what is ARM, why we care, and how we can ARM containers on x86.
+
+We'll start from a simple introduction on emulating ARM, move to more complex examples, then start integrate our approach with Docker and finally improve it.
+
+During each step there will be a live demo.
+
+We'll do an interactive session, so if you have a question please raise your hand.
+
 ---
 
 # About me
@@ -29,11 +39,19 @@ FOSSCOMM, April 2016
 	* Hundreds of ARM builds per day
 	* Many supported CPU architectures
 
+???
+
+We've done a lot of work on making Docker play nice with foreign architectures
+
 ---
 
 ### ARM
 
 # Most SoC have an ARM core
+
+* Used in almost all mobile phones
+* Used in the majority of SBCs
+
 
 * ARM CPUs
 	* Different instruction set
@@ -42,7 +60,7 @@ FOSSCOMM, April 2016
 
 ???
 
-RaspberryPi
+Single Board Computers like RaspberryPi
 
 ---
 
@@ -52,6 +70,12 @@ class: center, middle
 
 Our goal is to **build Dockerfiles** based on ARM docker images
 
+???
+
+Dockerfiles are recipes for building a docker image
+
+While a Dockerfile for x86 will have a `FROM ubuntu`, for ARM it might have `FROM raspbian`
+
 ---
 
 ### Why we run ARM on x86
@@ -60,6 +84,7 @@ Our goal is to **build Dockerfiles** based on ARM docker images
 
 * Pros
 	* Identical build and runtime environment
+	* The build has access to hardware peripherals
 
 
 * Cons
@@ -118,7 +143,7 @@ Tried but had issues
 ???
 
 * We've been running it in production for 2 years now
-* Had to fix bugs bugs in the emulation layer
+* Had to fix bugs in the emulation layer
 
 ---
 
@@ -129,7 +154,7 @@ Tried but had issues
 	* Supports many target architectures
 
 
-* Other options availalbe
+* Other options available
 	* e.g UMEQ
 
 ???
@@ -151,6 +176,10 @@ We could use the same technique to run MIPS containers in the future
 	* Emulates only the target binary
 	* System calls are serviced by **host kernel**
 		* Translated by the QEMU runtime
+
+???
+
+We are interested in the user-mode case
 
 ---
 
@@ -178,6 +207,8 @@ The host kernel doesn't see the guest ARM processes, or the filesystem
 
 QEMU must emulate a guest scheduler, a guest filesystem. Slow.
 
+Single core.
+
 ---
 
 ### QEMU
@@ -197,6 +228,12 @@ QEMU must emulate a guest scheduler, a guest filesystem. Slow.
 +---------------+
 </pre>
 
+???
+
+Each emulated ARM process maps 1-1 to a host process. While each process is single threaded, multiple process are schedules individually.
+
+Parallel programs run fast enough.
+
 ---
 
 class: center, middle
@@ -207,7 +244,7 @@ Simple QEMU emulation
 
 ???
 
-hello_native
+hello_simple
 
 Compile a simple Go binary for ARM and emulate it
 
@@ -293,6 +330,10 @@ strace -f -e trace=process qemu-arm ./hello_parent
 	* ELF (`fs/binfmt_elf.c`)
 	* Shebang (`fs/binfmt_script.c`)
 
+???
+
+The kernel parses the #! from the scripts
+
 ---
 
 # binfmt_misc
@@ -326,18 +367,24 @@ strace -f -e trace=process qemu-arm ./hello_parent
 echo ':arm:M::
 \x7fELF
 \x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00
-\x28
-\x00:\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff
+\x28\x00
+:\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff
 :/usr/bin/qemu-arm:' > /proc/sys/fs/binfmt_misc/register
 ```
 
 ???
+
+# 28' mark
+
+`readelf -h hello`
 
 * `:arm:` -> name of our format
 * `M` -> use magic to match binaries
 * `\x7fELF` -> ELF magic value
 * `\x28` -> e_machine value, architecture
 * `:/usr/bin/qemu-arm` -> path to interpreter
+
+Every time a binary matches this magic value, the kernel will run the interpreter instead of the binary and will pass the path of the binary as the first parameter to the interpreter
 
 ---
 
@@ -366,6 +413,10 @@ COPY qemu-arm /usr/bin/qemu-arm
 RUN echo "Hello from ARM Docker container :)"
 ```
 
+???
+
+I used alpine image because they are super small
+
 ---
 
 class: center, middle
@@ -375,6 +426,8 @@ class: center, middle
 Run an ARM Docker container
 
 ???
+
+Show `docker info`
 
 ```
 docker build .
@@ -412,6 +465,8 @@ Run an ARM Docker container with static QEMU
 
 ???
 
+docker_static
+
 ```
 ldd qemu-arm-static
 docker build .
@@ -428,9 +483,15 @@ class: center, middle
 # binfmt_misc is good but not great
 
 * Needs **root access** to configure
+
+
 * Not present in the majority of hosted tools
 
+
 * `execve(2)` is to blame
+
+
+* Can we implement `binfmt_misc` in **userspace**?
 
 ---
 
@@ -441,6 +502,27 @@ class: center, middle
 1. `do_syscall()` from `linux-user/syscall.c` runs
 1. Translates syscall number and arguments
 1. Calls **host kernel**
+
+---
+
+# Inside an `execve()`, take 2
+
+<pre>
++---------------+
+| Host process  |
+|+-------------+|
+||   ARM CPU   ||
+|| +---------+ ||            +-------+
+|| |   ARM   | ||   QEMU     | x86   |
+|| | process <---------------> linux |
+|| +---------+ || syscall.c  +-------+
+|+-------------+|
++---------------+
+</pre>
+
+???
+
+We can write a hook in syscall.c
 
 ---
 
@@ -470,9 +552,9 @@ static abi_long qemu_execve(char *filename, char *argv[], char *envp[]) {
 
 ???
 
-We inject 3 arguments and a NULL at the end
+We always execve to qemu. The kernel will never see a raw ARM process
 
-We always execve to qemu
+We inject 3 arguments and a NULL at the end so that QEMU knows what do emulate
 
 ---
 
@@ -487,6 +569,10 @@ COPY qemu-arm-static /usr/bin/qemu-arm
 
 RUN [ "qemu-arm", "/bin/echo", "Hello from ARM Docker container :)" ]
 ```
+
+???
+
+We have to prepend each and every RUN command with "qemu-arm" since there is no kernel module to do this for us.
 
 ---
 
@@ -523,9 +609,11 @@ execve("/bin/sh", { "-c", "foo" })
 
 # Improving the Dockerfile syntax
 
-1. Restore real `/bin/sh`
-1. Inject QEMU and run `/bin/sh` command
-1. Put modified /bin/sh back
+Use a x86 binary that
+
+1. Restores real `/bin/sh`
+1. Injects QEMU and run `/bin/sh` command
+1. Puts modified `/bin/sh` back
 
 ---
 
@@ -585,10 +673,6 @@ ARM Dockerfile with pretty syntax
 * Local development
 	* ARM containers Just Work™
 
-???
-
-Mention MIPS
-
 ---
 
 # resin.io <span style="color: red">♥</span> open source
@@ -605,7 +689,7 @@ Mention MIPS
 # resin.io <span style="color: red">♥</span> open source
 
 * [resin-io-library/base-images](https://github.com/resin-io-library/base-images)
-* [Dockerhub account](https://hub.docker.com/u/resin/)
+* [Resin.io Dockerhub](https://hub.docker.com/u/resin/)
 	* Dockerfiles for ARM5, ARM6, ARM7
 	* Dockerfiles for specific boards
 		* 15 boards supported
